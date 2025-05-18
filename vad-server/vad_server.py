@@ -6,15 +6,26 @@ import os
 import sys
 import logging
 import json # <-- Add this import
+from dotenv import load_dotenv
+
+# Load environment variables from .env file if it exists
+load_dotenv() 
 
 # --- Logging Setup ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+LOG_LEVEL = os.environ.get('LOG_LEVEL', 'INFO').upper()
+logging.basicConfig(level=LOG_LEVEL, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # --- Silero VAD Setup ---
 VAD_MODEL = None
 VAD_ITERATOR_CLASS = None
 TARGET_SAMPLE_RATE = 16000  # Silero VAD expects 16kHz
+
+# --- VAD Configuration (from environment or defaults) ---
+VAD_THRESHOLD = float(os.getenv('VAD_THRESHOLD', 0.6)) 
+VAD_MIN_SILENCE_DURATION_MS = int(os.getenv('VAD_MIN_SILENCE_DURATION_MS', 100)) 
+VAD_SPEECH_PAD_MS = int(os.getenv('VAD_SPEECH_PAD_MS', 200)) # Increased default from 30ms
+VAD_MIN_SPEECH_DURATION_MS = int(os.getenv('VAD_MIN_SPEECH_DURATION_MS', 250))
 
 def load_silero_vad_model():
     global VAD_MODEL, VAD_ITERATOR_CLASS
@@ -73,8 +84,16 @@ async def vad_audio_processor(websocket, path=None):
     client_address = websocket.remote_address
     logger.info(f"Client connected: {client_address}")
     
+    logger.info(f"Initializing VADIterator for {client_address} with: "
+                f"threshold={VAD_THRESHOLD}, "
+                f"min_silence_ms={VAD_MIN_SILENCE_DURATION_MS}, speech_pad_ms={VAD_SPEECH_PAD_MS}, "
+                f"min_speech_ms={VAD_MIN_SPEECH_DURATION_MS}")
     # Each client gets its own VADIterator instance
-    vad_iterator = VAD_ITERATOR_CLASS(VAD_MODEL, threshold=0.3, sampling_rate=TARGET_SAMPLE_RATE)
+    vad_iterator = VAD_ITERATOR_CLASS(VAD_MODEL, 
+                                      threshold=VAD_THRESHOLD, 
+                                      sampling_rate=TARGET_SAMPLE_RATE,
+                                      min_silence_duration_ms=VAD_MIN_SILENCE_DURATION_MS, # VADIterator uses this
+                                      speech_pad_ms=VAD_SPEECH_PAD_MS) # VADIterator uses this
     
     try:
         async for message in websocket:

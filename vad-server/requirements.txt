@@ -7,3 +7,4 @@ Soundfile
 pyaudio
 numpy
 websockets
+python-dotenv

@@ -19,6 +19,10 @@ function AudioVADClient() {
     const audioBufferForSttRef = useRef([]); // To store Int16Array chunks for current speech segment
     const isSpeechSegmentActiveRef = useRef(false); // True between VAD_SPEECH_START and VAD_SPEECH_END
 
+    // NEW: Microphone selection state
+    const [availableMics, setAvailableMics] = useState([]);
+    const [selectedMicId, setSelectedMicId] = useState(''); // Empty string for default microphone
+
     const audioContextRef = useRef(null);
     const mediaStreamRef = useRef(null);
     const scriptProcessorRef = useRef(null);
@@ -63,6 +67,48 @@ function AudioVADClient() {
         };
     // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
+
+    const getAudioInputDevices = async () => {
+        console.log("AudioVADClient: Attempting to enumerate audio input devices.");
+        try {
+            if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) {
+                console.warn("AudioVADClient: navigator.mediaDevices.enumerateDevices() not supported.");
+                setAvailableMics([{ deviceId: '', label: 'Default Microphone' }]);
+                setSelectedMicId(''); // Ensure default is selected if enumeration not supported
+                return;
+            }
+            // It's good practice to request permission before enumerating to get full labels,
+            // but for simplicity in initial load, we'll enumerate directly.
+            // Labels might be empty if permission hasn't been granted yet for this origin.
+            const devices = await navigator.mediaDevices.enumerateDevices();
+            const audioInputDevices = devices.filter(device =>  device.kind === 'audioinput');
+            
+            const micOptions = [
+                { deviceId: '', label: 'Default Microphone' }, 
+                ...audioInputDevices.map(device => ({
+                    deviceId: device.deviceId,
+                    label: device.label || `Microphone (${device.deviceId.substring(0, 8)}...)` 
+                }))
+            ];
+            setAvailableMics(micOptions);
+
+            // If no mic is selected, or if current selection is no longer valid, default to 'Default Microphone'.
+            const currentSelectionStillValid = micOptions.some(mic => mic.deviceId === selectedMicId);
+            if (!selectedMicId || !currentSelectionStillValid) {
+                 setSelectedMicId(''); 
+            }
+        } catch (err) {
+            console.error('AudioVADClient: Error enumerating audio devices:', err);
+            setAvailableMics([{ deviceId: '', label: 'Default Microphone (Error Enumerating)' }]);
+            setSelectedMicId('');
+        }
+    };
+
+    // Effect to load microphone list on mount
+    useEffect(() => {
+        getAudioInputDevices();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []); 
 
     const connectVadWebSocket = () => { // Renamed from connectWebSocket
         if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
@@ -231,8 +277,19 @@ function AudioVADClient() {
 
         try {
             setVadStatus('Initializing microphone...');
-            const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+            // Use selectedMicId for constraints. If selectedMicId is '', it uses the default device.
+            const constraints = {
+                audio: selectedMicId ? { deviceId: { exact: selectedMicId } } : true,
+                video: false
+            };
+            console.log("AudioVADClient: Using getUserMedia constraints:", constraints);
+            const stream = await navigator.mediaDevices.getUserMedia(constraints);
             mediaStreamRef.current = stream;
+
+            // After successfully getting the stream, labels for devices might be available if they weren't before.
+            // Optionally, re-fetch devices here to update labels, though it might cause a quick UI flicker.
+            // For simplicity, we'll skip re-fetching here for now. User can re-select if labels update.
+            // await getAudioInputDevices(); // Example: if you want to refresh labels post-permission
 
             audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)({
                 sampleRate: TARGET_SAMPLE_RATE
@@ -349,6 +406,24 @@ function AudioVADClient() {
                     Connect to STT Server
                 </button>
                 <span style={{ marginLeft: '10px' }}>STT Server: <strong>{sttServerStatus}</strong></span>
+            </div>
+
+            {/* NEW: Microphone Selection Dropdown */}
+            <div style={{ marginTop: '10px' }}>
+                <label htmlFor="mic-select" style={{ marginRight: '5px' }}>Microphone: </label>
+                <select 
+                    id="mic-select"
+                    value={selectedMicId} 
+                    onChange={(e) => setSelectedMicId(e.target.value)}
+                    disabled={isRecording || availableMics.length <= 1 && availableMics[0]?.label.includes("Error")} // Disable if recording or only error/default shown
+                    style={{ minWidth: '200px', padding: '5px' }}
+                >
+                    {availableMics.map(mic => (
+                        <option key={mic.deviceId || 'default-mic-option'} value={mic.deviceId}>
+                            {mic.label}
+                        </option>
+                    ))}
+                </select>
             </div>
 
             <div style={{ marginTop: '20px' }}>
