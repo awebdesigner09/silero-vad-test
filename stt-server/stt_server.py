@@ -22,7 +22,8 @@ PORT = int(os.environ.get('PORT', 8766)) # Different port from VAD server
 MODEL_NAME = os.environ.get('MODEL_NAME', "tiny.en") # e.g., "tiny.en", "base", "small"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 TARGET_SAMPLE_RATE = 16000 # Should match client's audio sample rate
-TURN_SILENCE_TIMEOUT_SECONDS = float(os.environ.get('TURN_SILENCE_TIMEOUT_SECONDS', 2.0)) # Seconds of silence to trigger end of turn
+TURN_SILENCE_TIMEOUT_SECONDS = float(os.environ.get('TURN_SILENCE_TIMEOUT_SECONDS', 3.0)) # Increased from 2.0s
+WHISPER_BEAM_SIZE = int(os.environ.get('WHISPER_BEAM_SIZE', 5)) # Added beam_size configuration
 
 # Load Whisper model (once at startup)
 model = None
@@ -86,7 +87,11 @@ async def _transcribe_and_send_audio(audio_data_bytes, websocket_conn, client_ad
         loop = asyncio.get_running_loop()
         # Use functools.partial to correctly pass keyword arguments to model.transcribe
         # model.transcribe expects audio as the first positional argument, and fp16 as a keyword argument.
-        transcribe_func = functools.partial(model.transcribe, audio=audio_float32, fp16=use_fp16)
+        transcribe_options = {"fp16": use_fp16}
+        if WHISPER_BEAM_SIZE > 0: # beam_size of 0 or None might use default, explicitly set if > 0
+            transcribe_options["beam_size"] = WHISPER_BEAM_SIZE
+        
+        transcribe_func = functools.partial(model.transcribe, audio=audio_float32, **transcribe_options)
         result = await loop.run_in_executor(None, transcribe_func)
         transcription_text = result["text"]
         logger.info(f"Transcription for {client_addr}: {transcription_text}")

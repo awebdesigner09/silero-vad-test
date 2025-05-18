@@ -3,7 +3,6 @@ import asyncio
 import websockets
 import torch
 import os
-import sys
 import logging
 import json # <-- Add this import
 from dotenv import load_dotenv
@@ -23,53 +22,29 @@ TARGET_SAMPLE_RATE = 16000  # Silero VAD expects 16kHz
 
 # --- VAD Configuration (from environment or defaults) ---
 VAD_THRESHOLD = float(os.getenv('VAD_THRESHOLD', 0.6)) 
-VAD_MIN_SILENCE_DURATION_MS = int(os.getenv('VAD_MIN_SILENCE_DURATION_MS', 100)) 
+VAD_MIN_SILENCE_DURATION_MS = int(os.getenv('VAD_MIN_SILENCE_DURATION_MS', 300)) # Increased from 100ms
 VAD_SPEECH_PAD_MS = int(os.getenv('VAD_SPEECH_PAD_MS', 200)) # Increased default from 30ms
 VAD_MIN_SPEECH_DURATION_MS = int(os.getenv('VAD_MIN_SPEECH_DURATION_MS', 250))
 
 def load_silero_vad_model():
     global VAD_MODEL, VAD_ITERATOR_CLASS
     try:
-        # Try to find the local silero-vad-repo relative to this script
-        current_script_path = os.path.dirname(os.path.abspath(__file__))
-        # Assuming silero-vad-repo is in the same directory as this script or one level up
-        # Adjust these paths if your project structure is different
-        possible_repo_paths = [
-            os.path.join(current_script_path, 'silero-vad-repo'),
-            os.path.join(current_script_path, '..', 'silero-vad-repo'),
-            '/root/silero-vad-test/silero-vad-repo' # Default from original script
-        ]
-        
-        silero_vad_repo_path = os.getenv('SILERO_VAD_REPO_PATH')
-        if not silero_vad_repo_path:
-            for path_attempt in possible_repo_paths:
-                if os.path.isdir(path_attempt):
-                    silero_vad_repo_path = path_attempt
-                    logger.info(f"Found Silero VAD repo at: {silero_vad_repo_path}")
-                    break
-        
-        if not silero_vad_repo_path or not os.path.isdir(silero_vad_repo_path):
-            logger.error(f"Silero VAD repo path not found. Tried: {possible_repo_paths}. "
-                         "Set SILERO_VAD_REPO_PATH or adjust script.")
-            sys.exit(1)
-
-        sys.path.insert(0, os.path.join(silero_vad_repo_path, 'src'))
-        from silero_vad import utils_vad
-        
-        model_file_path = os.path.join(silero_vad_repo_path, 'src', 'silero_vad', 'data', 'silero_vad.jit')
-        if not os.path.exists(model_file_path):
-            logger.error(f"Silero VAD model file not found at: {model_file_path}")
-            sys.exit(1)
-
-        # Load the JIT model
-        # Assuming utils_vad.init_jit_model returns only the model based on previous context
-        VAD_MODEL = utils_vad.init_jit_model(model_file_path, device=torch.device('cpu')) # Specify device
-        VAD_ITERATOR_CLASS = utils_vad.VADIterator 
+        logger.info("Attempting to load Silero VAD model using torch.hub.load...")
+        # `force_reload=True` can be useful for debugging or ensuring the latest version,
+        # but for production, `force_reload=False` (default) is usually better to use cached versions.
+        # `trust_repo=True` is required for this specific repository.
+        model, utils = torch.hub.load(repo_or_dir='snakers4/silero-vad',
+                                      model='silero_vad',
+                                      force_reload=False, # Set to True to always re-download
+                                      trust_repo=True)
+        VAD_MODEL = model
+        (get_speech_timestamps,
+         save_audio,
+         read_audio,
+         VADIterator,
+         collect_chunks) = utils
+        VAD_ITERATOR_CLASS = VADIterator
         logger.info("Silero VAD model loaded successfully.")
-
-    except ImportError:
-        logger.exception("Failed to import Silero VAD. Ensure 'silero-vad-repo/src' is in sys.path or Silero VAD is installed.")
-        sys.exit(1)
     except Exception as e:
         logger.exception(f"Error during Silero VAD setup: {e}")
         sys.exit(1)
