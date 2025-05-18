@@ -1,0 +1,9 @@
+# Python == 3.6.9
+webrtcvad
+torchaudio
+torch
+halo
+Soundfile
+pyaudio
+numpy
+websockets
