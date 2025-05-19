@@ -1,6 +1,7 @@
+// src/App.js
 import React from 'react';
-import AudioVADClient from './components/AudioVADClient'; // Updated path
-import './App.css'; // Optional: if you have App-specific CSS
+import AudioVADClient from './components/AudioVADClient';
+import './App.css';
 
 function App() {
   return (
