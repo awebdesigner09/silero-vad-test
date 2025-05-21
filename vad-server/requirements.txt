@@ -8,3 +8,6 @@ pyaudio
 numpy
 websockets
 python-dotenv
+aiortc>=1.5.0
+aioice>=0.9.0
+pylibsrtp>=0.10.0

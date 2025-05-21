@@ -1,456 +1,301 @@
-// src/AudioVADClient.js (or wherever you place your React components)
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 
-const VAD_SERVER_URL = 'ws://localhost:8765'; // VAD server
-const TARGET_SAMPLE_RATE = 16000; // Must match server and VAD model. Silero VAD expects 512 samples for 16kHz.
-const SCRIPT_PROCESSOR_BUFFER_SIZE = 512; // Or 2048, 4096. Affects latency and chunk size. For 16kHz, Silero VAD expects 512.
-const STT_SERVER_URL = 'ws://localhost:8766'; // NEW: STT Server URL
+// Configuration - Make sure this matches your server's HTTP signaling endpoint
+const SIGNALING_SERVER_URL = 'http://localhost:8766/offer'; // Server runs on PORT + 1 (8765 + 1)
 
 function AudioVADClient() {
-    const [isRecording, setIsRecording] = useState(false);
-    const [vadStatus, setVadStatus] = useState('Idle');
-    const [serverStatus, setServerStatus] = useState('Disconnected');
-    const isRecordingRef = useRef(isRecording);
+  const pc = useRef(null); // RTCPeerConnection instance
+  const dataChannel = useRef(null); // DataChannel for receiving VAD status
+  const localStream = useRef(null); // Local media stream (microphone)
 
-    // NEW: STT related state and refs
-    const [sttServerStatus, setSttServerStatus] = useState('Disconnected');
-    const [transcription, setTranscription] = useState('');
-    const sttSocketRef = useRef(null);
-    const audioBufferForSttRef = useRef([]); // To store Int16Array chunks for current speech segment
-    const isSpeechSegmentActiveRef = useRef(false); // True between VAD_SPEECH_START and VAD_SPEECH_END
+  const [connectionState, setConnectionState] = useState('disconnected');
+  const [vadStatus, setVadStatus] = useState(false);
+  const [error, setError] = useState(null);
+  const [transcription, setTranscription] = useState('');
+  const [isConnecting, setIsConnecting] = useState(false);
+  
+  // Ref to manage effect execution in StrictMode for development
+  const effectRan = useRef(false);
 
-    // NEW: Microphone selection state
-    const [availableMics, setAvailableMics] = useState([]);
-    const [selectedMicId, setSelectedMicId] = useState(''); // Empty string for default microphone
+  const startWebRTC = async () => {
+    // Guard against starting if already connecting or if a connection exists and isn't closed.
+    if (isConnecting) {
+      console.log('startWebRTC: Aborting, connection attempt already in progress (isConnecting).');
+      return;
+    }    if (pc.current && pc.current.connectionState !== 'closed') {
+      console.log('Connection already exists or is in progress.');
+      return;
+    }
 
-    const audioContextRef = useRef(null);
-    const mediaStreamRef = useRef(null);
-    const scriptProcessorRef = useRef(null);
-    const socketRef = useRef(null);
+    setIsConnecting(true);
+    setError(null);
+    setVadStatus(false);
+    setTranscription('');
+    setConnectionState('connecting');
+    console.log('startWebRTC: Initiating new connection attempt.');
 
-    // Effect for WebSocket connection management
-    useEffect(() => {
-        isRecordingRef.current = isRecording;
-    }, [isRecording]);
+    try {
+      // 1. Get user media (microphone)
+      localStream.current = await navigator.mediaDevices.getUserMedia({ audio: true });
+      console.log('Microphone access granted.');
 
+      // 2. Create RTCPeerConnection
+      // Ensure any old pc is cleaned up if this is a restart. stopWebRTC should handle this,
+      // but explicitly creating a new one here is key.
+      pc.current = new RTCPeerConnection();
+      console.log('RTCPeerConnection created.');
 
-    useEffect(() => {
-        // Connect to VAD server on mount
-        connectVadWebSocket(); // Renamed for clarity
+      // 3. Add microphone track to the connection
+      localStream.current.getTracks().forEach(track => {
+        pc.current.addTrack(track, localStream.current);
+        console.log('Microphone track added.');
+      });
 
-        return () => { // Cleanup on unmount
-            console.log("AudioVADClient: useEffect cleanup running");
-            if (isRecordingRef.current) { // Use ref to get current recording state
-                stopRecordingLogic();
-            }
-            if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
-                console.log("AudioVADClient: Closing WebSocket from useEffect cleanup");
-                socketRef.current.close();
-            }
-            
-            socketRef.current = null; // Nullify the ref
-        };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, []); // Run once on mount
-    
-    // NEW: useEffect for STT WebSocket connection management
-    useEffect(() => {
-        connectSttWebSocket();
-
-        return () => {
-            console.log("AudioVADClient: STT useEffect cleanup running");
-            if (sttSocketRef.current && sttSocketRef.current.readyState === WebSocket.OPEN) {
-                console.log("AudioVADClient: Closing STT WebSocket from useEffect cleanup");
-                sttSocketRef.current.close();
-            }
-            sttSocketRef.current = null;
-        };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, []);
-
-    const getAudioInputDevices = async () => {
-        console.log("AudioVADClient: Attempting to enumerate audio input devices.");
-        try {
-            if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) {
-                console.warn("AudioVADClient: navigator.mediaDevices.enumerateDevices() not supported.");
-                setAvailableMics([{ deviceId: '', label: 'Default Microphone' }]);
-                setSelectedMicId(''); // Ensure default is selected if enumeration not supported
-                return;
-            }
-            // It's good practice to request permission before enumerating to get full labels,
-            // but for simplicity in initial load, we'll enumerate directly.
-            // Labels might be empty if permission hasn't been granted yet for this origin.
-            const devices = await navigator.mediaDevices.enumerateDevices();
-            const audioInputDevices = devices.filter(device =>  device.kind === 'audioinput');
-            
-            const micOptions = [
-                { deviceId: '', label: 'Default Microphone' }, 
-                ...audioInputDevices.map(device => ({
-                    deviceId: device.deviceId,
-                    label: device.label || `Microphone (${device.deviceId.substring(0, 8)}...)` 
-                }))
-            ];
-            setAvailableMics(micOptions);
-
-            // If no mic is selected, or if current selection is no longer valid, default to 'Default Microphone'.
-            const currentSelectionStillValid = micOptions.some(mic => mic.deviceId === selectedMicId);
-            if (!selectedMicId || !currentSelectionStillValid) {
-                 setSelectedMicId(''); 
-            }
-        } catch (err) {
-            console.error('AudioVADClient: Error enumerating audio devices:', err);
-            setAvailableMics([{ deviceId: '', label: 'Default Microphone (Error Enumerating)' }]);
-            setSelectedMicId('');
+      // 4. Set up event handlers
+      pc.current.onicecandidate = event => {
+        if (event.candidate) {
+          // Send ICE candidates to the server if needed (optional for simple setups)
+          // console.log('ICE candidate:', event.candidate);
+          // Note: For this simple example, we rely on trickle ICE being handled
+          // implicitly by the SDP exchange or not strictly required for localhost.
+          // In production, you'd send candidates to the server here.
         }
-    };
+      };
 
-    // Effect to load microphone list on mount
-    useEffect(() => {
-        getAudioInputDevices();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, []); 
-
-    const connectVadWebSocket = () => { // Renamed from connectWebSocket
-        if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
-            console.log("VAD WebSocket already connected.");
+      pc.current.onconnectionstatechange = () => {
+        // If pc.current has been nulled by stopWebRTC (e.g., due to another cleanup), bail.
+        if (!pc.current) {
+            console.log('onconnectionstatechange: pc.current is null, bailing.');
             return;
         }
-
-        console.log(`Attempting to connect to VAD WebSocket server at ${VAD_SERVER_URL}`);
-        if(socketRef.current) {
-            socketRef.current.close(); // Close any existing connection
-        }
+        console.log('Connection state changed:', pc.current.connectionState);
+        setConnectionState(pc.current.connectionState);
         
-        setServerStatus('Connecting...'); // VAD server status
-        socketRef.current = new WebSocket(VAD_SERVER_URL);
+        const currentPcState = pc.current.connectionState;
+        if (currentPcState === 'failed' || currentPcState === 'disconnected' || currentPcState === 'closed') {
+            console.log(`onconnectionstatechange: PC state is ${currentPcState}, calling stopWebRTC.`);
+            stopWebRTC(); // Clean up on failure, disconnection or explicit close
+        }
+      };
 
-        socketRef.current.onopen = () => {
-            console.log('VAD WebSocket connected');
-            setServerStatus('Connected'); // VAD server status
-            // VAD status will be updated by messages from the server
-        };
+      pc.current.ondatachannel = event => {
+        // This handler is for data channels INITIATED BY THE REMOTE PEER (the server)
+        console.log('Data channel received from server:', event.channel.label);
+        if (event.channel.label === 'vad_status_feed') {
+          dataChannel.current = event.channel;
 
-        socketRef.current.onmessage = (event) => {
-            // IMPORTANT ASSUMPTION: VAD server sends JSON messages
-            // e.g., {"type": "VAD_SPEECH_START"} or {"type": "VAD_SPEECH_END"} or {"type": "VAD_STATUS", "message": "..."}
+          // Assign handlers to the new channel
+          event.channel.onopen = () => {
+            console.log('VAD status data channel opened.');
+            // You could send a message to the server here if needed, e.g., a "ready" signal
+            // dataChannel.current.send(JSON.stringify({ status: 'ready' }));
+          };
+
+          event.channel.onmessage = msgEvent => {
             try {
-                const vadData = JSON.parse(event.data);
-                console.log('AudioVADClient: VAD Data from server:', vadData);
-                
-                if (vadData.type === "VAD_SPEECH_START") {
-                    setVadStatus('Speech Detected');
-                    audioBufferForSttRef.current = []; // Start new buffer for STT
-                    isSpeechSegmentActiveRef.current = true;
-                    // setTranscription(''); // Clear previous transcription when new speech starts
-                } else if (vadData.type === "VAD_SPEECH_END") {
-                    setVadStatus('Speech Ended');
-                    isSpeechSegmentActiveRef.current = false;
-                    if (sttSocketRef.current && sttSocketRef.current.readyState === WebSocket.OPEN && audioBufferForSttRef.current.length > 0) {
-                        // Concatenate all Int16Array chunks
-                        let totalLength = 0;
-                        audioBufferForSttRef.current.forEach(chunk => totalLength += chunk.length);
-                        
-                        if (totalLength > 0) {
-                            const concatenatedAudio = new Int16Array(totalLength);
-                            let offset = 0;
-                            audioBufferForSttRef.current.forEach(chunk => {
-                                concatenatedAudio.set(chunk, offset);
-                                offset += chunk.length;
-                            });
-
-                            console.log(`Sending ${concatenatedAudio.length} audio samples (${(totalLength * 2 / 1024).toFixed(2)} KB) to STT server.`);
-                            sttSocketRef.current.send(concatenatedAudio.buffer);
-                            sttSocketRef.current.send("END_OF_STREAM"); // Signal end of this audio segment
-                            setVadStatus('Segment sent for transcription...');
-                        } else {
-                             console.log("No audio buffered for STT for this speech segment (totalLength is 0).");
-                        }
-                    } else {
-                        if (!sttSocketRef.current || sttSocketRef.current.readyState !== WebSocket.OPEN) {
-                             console.warn("STT WebSocket not open. Cannot send audio for transcription.");
-                             setVadStatus('STT server not ready for transcription.');
-                        }
-                        if (audioBufferForSttRef.current.length === 0) {
-                            console.log("No audio buffered for STT for this speech segment (buffer empty).");
-                        }
-                    }
-                    audioBufferForSttRef.current = []; // Clear buffer after sending or if not sent
-                } else if (vadData.type === "VAD_STATUS") {
-                    setVadStatus(vadData.message || 'VAD Status Update');
-                } else {
-                    // Fallback for other message types or non-JSON messages
-                    console.warn('AudioVADClient: Received unhandled VAD message type or non-JSON:', vadData);
-                    setVadStatus(typeof event.data === 'string' ? event.data : JSON.stringify(event.data));
-                }
-            } catch (error) {
-                console.error("Error parsing VAD message or VAD message was not JSON:", event.data, error);
-                setVadStatus(event.data); // Display raw data if not JSON
+              const data = JSON.parse(msgEvent.data);
+              if (data.vad_status !== undefined && typeof data.vad_status === 'boolean') {
+                // console.log('Received VAD status:', data.vad_status); // Keep this if you want separate VAD status logs
+                setVadStatus(data.vad_status);
+              } else if (data.type === "stt_transcription" && data.data && data.data.transcription) {
+                console.log('Received transcription:', data.data.transcription);
+                // For continuous transcription, you might append. For now, replacing.
+                // Also, consider if data.data.is_final is true to clear previous partials.
+                setTranscription(prev => prev + data.data.transcription + " "); // Append new transcription parts
+              }
+            } catch (parseError) {
+              console.error('Failed to parse VAD status message:', parseError);
             }
-        };
+          };
 
-        socketRef.current.onerror = (error) => {
-            console.error('WebSocket Error:', error);
-            setServerStatus('Connection Error');
-            setVadStatus('Server error');
-            // Auto-stop recording if it was active and connection drops
-            if (isRecordingRef.current) { // Use ref here
-                stopRecordingLogic();
-                setIsRecording(false);
+          event.channel.onclose = () => {
+            console.log('VAD status data channel closed.');
+            setVadStatus(false); // Reset VAD status on channel close
+            // setTranscription(''); // Optionally clear transcription
+            if (dataChannel.current === event.channel) { // Clear ref if this is the active channel
+              dataChannel.current = null;
             }
-        };
+          };
 
-        socketRef.current.onclose = (event) => {
-            console.log('VAD WebSocket disconnected:', event.reason || 'No reason given');
-            setServerStatus(`Disconnected: ${event.reason || 'Closed'}`); // VAD server status
-            setVadStatus('Disconnected from server');
-            isSpeechSegmentActiveRef.current = false; // Reset speech segment flag
-            if (isRecordingRef.current) { // Use ref here
-                stopRecordingLogic();
-                setIsRecording(false);
-            }
-        };
-    };
-
-    // NEW: connectSttWebSocket function
-    const connectSttWebSocket = () => {
-        if (sttSocketRef.current && sttSocketRef.current.readyState === WebSocket.OPEN) {
-            console.log("STT WebSocket already connected.");
-            return;
+          event.channel.onerror = err => {
+            console.error('VAD status data channel error:', err);
+            setError('Data channel error');
+          };
+        } else {
+            console.warn(`Received unexpected data channel: ${event.channel.label}`);
         }
-        console.log(`Attempting to connect to STT WebSocket server at ${STT_SERVER_URL}`);
-        if(sttSocketRef.current) {
-            sttSocketRef.current.close();
-        }
-        setSttServerStatus('Connecting...');
-        sttSocketRef.current = new WebSocket(STT_SERVER_URL);
+      };
 
-        sttSocketRef.current.onopen = () => {
-            console.log('STT WebSocket connected');
-            setSttServerStatus('Connected');
-        };
+      // 5. Create offer
+      const offer = await pc.current.createOffer();
+      await pc.current.setLocalDescription(offer);
+      console.log('Offer created and set as local description.');
 
-        sttSocketRef.current.onmessage = (event) => {
-            // Assume STT server sends JSON: {"transcription": "...", "error": "..."}
+      // Wait for ICE gathering to complete (optional, but can help)
+      // In a real app, you might use trickle ICE instead of waiting.
+      // For simplicity here, we'll just proceed.
+      // await new Promise(resolve => {
+      //   if (pc.current.iceGatheringState === 'complete') {
+      //     resolve();
+      //   } else {
+      //     pc.current.onicegatheringstatechange = () => {
+      //       if (pc.current.iceGatheringState === 'complete') {
+      //         resolve();
+      //       }
+      //     };
+      //   }
+      // });
+
+      // 6. Send offer to server and receive answer
+      console.log('Sending offer to signaling server...');
+      const response = await fetch(SIGNALING_SERVER_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          sdp: offer.sdp,
+          type: offer.type,
+        }),
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`Signaling server error: ${response.status} ${errorText}`);
+      }
+
+      const answer = await response.json();
+      console.log('Received answer from signaling server.');
+
+      // 7. Set server's answer as remote description
+       if (pc.current && (pc.current.signalingState === 'have-local-offer' || pc.current.signalingState === 'pranswer')) { // pranswer is also a valid state
             try {
-                const sttResult = JSON.parse(event.data);
-                console.log('AudioVADClient: STT Result from server:', sttResult);
-                if (sttResult.error) {
-                    console.error('STT Server Error:', sttResult.error);
-                    setTranscription(prev => `${prev}\n[STT Error: ${sttResult.error}]`.trim());
-                } else {
-                    // Append new transcription to existing ones for the session, or replace if desired
-                    setTranscription(prev => `${prev} ${sttResult.transcription}`.trim());
-                }
-                setVadStatus('Transcription received.'); // Update main status to reflect STT activity
-            } catch (error) {
-                console.error("Error parsing STT message or STT message was not JSON:", event.data, error);
-                setTranscription(prev => `${prev}\n[Raw STT Data: ${event.data}]`.trim());
+                await pc.current.setRemoteDescription(new RTCSessionDescription(answer));
+                console.log('Answer set as remote description. Connection should now be stable or connecting.');
+            } catch (e) {
+                console.error('Error setting remote description (answer):', e);
+                setError(`Error setting remote answer: ${e.message}`);
+                stopWebRTC(); // Clean up on error
             }
-        };
-
-        sttSocketRef.current.onerror = (error) => {
-            console.error('STT WebSocket Error:', error);
-            setSttServerStatus('Connection Error');
-            setTranscription(prev => `${prev}\n[STT Server connection error.]`.trim());
-        };
-
-        sttSocketRef.current.onclose = (event) => {
-            console.log('STT WebSocket disconnected:', event.reason || 'No reason given');
-            setSttServerStatus(`Disconnected: ${event.reason || 'Closed'}`);
-        };
-    };
-
-    const startRecording = async () => {
-        console.log("AudioVADClient: startRecording called");
-        if (isRecordingRef.current) return; // Use ref
-
-        if (!socketRef.current || socketRef.current.readyState !== WebSocket.OPEN) {
-            console.warn("AudioVADClient: VAD WebSocket not open. Cannot start recording.");
-            setVadStatus('VAD Server not connected. Try connecting first.');
-            return;
-        }
-        // Optionally check STT connection too, but VAD can run without STT
-        if (!sttSocketRef.current || sttSocketRef.current.readyState !== WebSocket.OPEN) {
-            console.warn("AudioVADClient: STT WebSocket not open. Transcription will not be available until STT server is connected.");
-            // setSttServerStatus('Not Connected. Transcription disabled.'); // Or try to connect
-        }
-
-        try {
-            setVadStatus('Initializing microphone...');
-            // Use selectedMicId for constraints. If selectedMicId is '', it uses the default device.
-            const constraints = {
-                audio: selectedMicId ? { deviceId: { exact: selectedMicId } } : true,
-                video: false
-            };
-            console.log("AudioVADClient: Using getUserMedia constraints:", constraints);
-            const stream = await navigator.mediaDevices.getUserMedia(constraints);
-            mediaStreamRef.current = stream;
-
-            // After successfully getting the stream, labels for devices might be available if they weren't before.
-            // Optionally, re-fetch devices here to update labels, though it might cause a quick UI flicker.
-            // For simplicity, we'll skip re-fetching here for now. User can re-select if labels update.
-            // await getAudioInputDevices(); // Example: if you want to refresh labels post-permission
-
-            audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)({
-                sampleRate: TARGET_SAMPLE_RATE
-            });
-            
-            await audioContextRef.current.resume(); // Ensure context is running
-
-            const source = audioContextRef.current.createMediaStreamSource(stream);
-            
-            scriptProcessorRef.current = audioContextRef.current.createScriptProcessor(
-                SCRIPT_PROCESSOR_BUFFER_SIZE, // bufferSize
-                1,                            // inputChannels
-                1                             // outputChannels
+        } else {
+            const currentState = pc.current ? pc.current.signalingState : 'null';
+            console.error(
+                `Cannot set remote description. PeerConnection is in wrong state: ${currentState} (expected have-local-offer or pranswer) or pc.current is null.`
             );
-
-            scriptProcessorRef.current.onaudioprocess = (audioProcessingEvent) => {
-                if (!isRecordingRef.current) return; // Check master recording flag
-
-                const inputBuffer = audioProcessingEvent.inputBuffer;
-                const pcmDataFloat32 = inputBuffer.getChannelData(0); // Float32, range -1.0 to 1.0
-
-                // Convert Float32 to Int16
-                const pcmDataInt16 = new Int16Array(pcmDataFloat32.length);
-                for (let i = 0; i < pcmDataFloat32.length; i++) {
-                    pcmDataInt16[i] = Math.max(-1, Math.min(1, pcmDataFloat32[i])) * 32767;
-                }
-                
-                // Send to VAD server
-                if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
-                    // console.log("AudioVADClient: Sending audio data chunk to VAD server..."); // Can be very noisy
-                    socketRef.current.send(pcmDataInt16.buffer);
-                } else {
-                    // This log can be noisy if VAD disconnects during recording
-                    // console.log(`AudioVADClient: VAD socket not ready. Not sending. isRecordingRef: ${isRecordingRef.current}, vadSocketReadyState: ${socketRef.current ? socketRef.current.readyState : 'null'}`);
-                }
-
-                // Buffer for STT if speech segment is active (based on VAD server signals)
-                if (isSpeechSegmentActiveRef.current) {
-                    // Create a copy of pcmDataInt16 for the buffer, as the underlying ArrayBuffer might be reused or sent.
-                    audioBufferForSttRef.current.push(pcmDataInt16.slice());
-                }
-            };
-
-            source.connect(scriptProcessorRef.current);
-            scriptProcessorRef.current.connect(audioContextRef.current.destination); // Necessary for ScriptProcessorNode to fire
-
-            setIsRecording(true); // This will trigger isRecordingRef.current update via useEffect
-            setVadStatus('Recording...');
-            setTranscription(''); // Clear previous transcriptions on new recording start
-            console.log("AudioVADClient: Recording started successfully.");
-        } catch (err) {
-            console.error('Error starting recording:', err);
-            setVadStatus(`Mic Error: ${err.message}`);
-            setIsRecording(false); // Ensure state is updated
-            stopRecordingLogic(); // Clean up any partial setup
+            // This indicates a problem with how startWebRTC is called or how pc.current is managed.
+            // You might want to call stopWebRTC() here if the state is invalid.
+            // If pc.current exists and is not already closed, and we are in a bad state, stop this attempt.
+            if (pc.current && pc.current.signalingState !== 'closed') {
+                stopWebRTC();
+            }
+            setError(`Failed to set remote answer: PC in wrong state (${currentState})`);
         }
+
+    } catch (e) {
+      console.error('WebRTC connection failed:', e);
+      setError(`Connection failed: ${e.message}`);
+      setConnectionState('failed');
+      stopWebRTC(); // Clean up on error
+    } finally {
+        setIsConnecting(false);
+        console.log('startWebRTC: Connection attempt finished (finally block).');
+        // If connection failed, transcription might need reset if not already done
+    }
+  };
+
+  const stopWebRTC = () => {
+    console.log('stopWebRTC: Attempting to stop WebRTC connection...');
+    setIsConnecting(false); // Ensure isConnecting is reset
+        if (dataChannel.current) {
+      // Remove event handlers before closing
+      dataChannel.current.onopen = null;
+      dataChannel.current.onmessage = null;
+      dataChannel.current.onclose = null;
+      dataChannel.current.onerror = null;
+      dataChannel.current.close();
+      dataChannel.current = null;
+    }
+
+    const pcToClose = pc.current; // Capture before potentially nullifying
+    if (pcToClose) {
+      console.log(`stopWebRTC: PeerConnection found. State: ${pcToClose.connectionState}, Signaling: ${pcToClose.signalingState}`);
+
+      // Remove event handlers
+      pc.current.onicecandidate = null;
+      pc.current.onconnectionstatechange = null;
+      pc.current.ondatachannel = null;
+      // If you were using pc.current.ontrack, nullify it here too
+      // pc.current.ontrack = null;
+
+      // Only close if not already closed
+      if (pcToClose.signalingState !== 'closed') {
+        pcToClose.close();
+        console.log('stopWebRTC: pc.close() called.');
+      }
+      // Nullify the ref if it's still pointing to the PC we just handled.
+      // This helps prevent using a closed PC.
+      if(pc.current === pcToClose) pc.current = null;
+    }
+    if (localStream.current) {
+      localStream.current.getTracks().forEach(track => track.stop());
+      localStream.current = null;
+    }
+    setConnectionState('disconnected');
+    setVadStatus(false);
+    setTranscription(''); // Clear transcription on stop
+    setIsConnecting(false);
+    // setError(null); // Optionally reset error on explicit stop
+    console.log('stopWebRTC: Procedure finished.');
+  };
+
+  // Effect to start the connection when the component mounts
+  useEffect(() => {
+    // In development, React StrictMode runs effects twice to help find bugs.
+    // This ref-based approach ensures startWebRTC is effectively called once on "true" mount.
+    if (process.env.NODE_ENV === 'development') {
+      if (effectRan.current === false) {
+        console.log('useEffect: Running startWebRTC (Strict Mode - first run)');
+        startWebRTC();
+        effectRan.current = true; // Mark that the effect's main logic has run
+      } else {
+        console.log('useEffect: Skipped startWebRTC (Strict Mode - subsequent run)');
+      }
+    } else {
+      // In production, it runs once.
+      console.log('useEffect: Running startWebRTC (Production Mode)');
+      startWebRTC();
+    }
+
+    // Effect cleanup function to stop the connection when the component unmounts
+    return () => {
+      console.log('useEffect: Cleanup function running - calling stopWebRTC.');
+      stopWebRTC();
+      // Do NOT reset effectRan.current to false here for StrictMode's mount/unmount/mount cycle.
+      // It should remain true to indicate that for this component instance's "true" mount,
+      // the setup effect has already run. It will naturally be false if the component truly unmounts and a new instance is later mounted.
     };
+  }, []); // Empty dependency array: runs on mount and unmount (or simulated unmount/remount in StrictMode)
 
-    const stopRecordingLogic = () => {
-        isSpeechSegmentActiveRef.current = false; // Ensure this is reset
-        // If there's any buffered audio for STT when recording stops abruptly,
-        // it's currently discarded if VAD_SPEECH_END wasn't received and processed.
-        // Depending on requirements, one might choose to send it here.
-        audioBufferForSttRef.current = []; 
-
-        if (mediaStreamRef.current) {
-            mediaStreamRef.current.getTracks().forEach(track => track.stop());
-            mediaStreamRef.current = null;
-        }
-        if (scriptProcessorRef.current) {
-            scriptProcessorRef.current.disconnect();
-            scriptProcessorRef.current.onaudioprocess = null; // Important to remove the callback
-            scriptProcessorRef.current = null;
-        }
-        if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
-            audioContextRef.current.close().catch(e => console.error("Error closing AudioContext:", e));
-            audioContextRef.current = null;
-        }
-        console.log("AudioVADClient: stopRecordingLogic executed.");
-    };
-
-    const stopRecording = () => {
-        if (!isRecording) return; // Check state, button disabled based on this
-
-        console.log("AudioVADClient: stopRecording called by user");
-        
-        // Explicitly set isRecording to false. This will update isRecordingRef via its useEffect.
-        setIsRecording(false); 
-        stopRecordingLogic(); // Call the core logic to stop audio processing and cleanup resources
-
-        // Note: If user stops mid-speech, the current VAD server logic (if not updated)
-        // might not send a VAD_SPEECH_END. The audio buffered for STT up to this point
-        // would be cleared by stopRecordingLogic without being sent.
-        // For a more robust solution, one might send any pending audio here,
-        // or the VAD server could detect abrupt client disconnects during speech.
-
-        setVadStatus('Recording stopped. Ready.');
-    };
-
-    return (
-        <div style={{ padding: '20px', fontFamily: 'Arial, sans-serif' }}>
-            <h2>Real-time VAD + STT Client (React + Silero VAD + Whisper)</h2>
-            
-            <div>
-                <button onClick={connectVadWebSocket} disabled={serverStatus === 'Connected' || serverStatus === 'Connecting...'}>
-                    Connect to VAD Server
-                </button>
-                <span style={{ marginLeft: '10px' }}>VAD Server: <strong>{serverStatus}</strong></span>
-            </div>
-
-            {/* NEW: STT Server Connection UI */}
-            <div style={{ marginTop: '10px' }}>
-                <button onClick={connectSttWebSocket} disabled={sttServerStatus === 'Connected' || sttServerStatus === 'Connecting...'}>
-                    Connect to STT Server
-                </button>
-                <span style={{ marginLeft: '10px' }}>STT Server: <strong>{sttServerStatus}</strong></span>
-            </div>
-
-            {/* NEW: Microphone Selection Dropdown */}
-            <div style={{ marginTop: '10px' }}>
-                <label htmlFor="mic-select" style={{ marginRight: '5px' }}>Microphone: </label>
-                <select 
-                    id="mic-select"
-                    value={selectedMicId} 
-                    onChange={(e) => setSelectedMicId(e.target.value)}
-                    disabled={isRecording || availableMics.length <= 1 && availableMics[0]?.label.includes("Error")} // Disable if recording or only error/default shown
-                    style={{ minWidth: '200px', padding: '5px' }}
-                >
-                    {availableMics.map(mic => (
-                        <option key={mic.deviceId || 'default-mic-option'} value={mic.deviceId}>
-                            {mic.label}
-                        </option>
-                    ))}
-                </select>
-            </div>
-
-            <div style={{ marginTop: '20px' }}>
-                <button 
-                    onClick={startRecording} 
-                    disabled={isRecording || serverStatus !== 'Connected' /* Optional: || sttServerStatus !== 'Connected' */}
-                >
-                    Start Recording
-                </button>
-                <button onClick={stopRecording} disabled={!isRecording} style={{ marginLeft: '10px' }}>
-                    Stop Recording
-                </button>
-            </div>
-            <p style={{ marginTop: '20px', fontSize: '1.2em' }}>
-                VAD Status: <strong style={{ color: vadStatus.toLowerCase().includes('speech') ? 'green' : (vadStatus.toLowerCase().includes('error') ? 'red' : 'black') }}>{vadStatus}</strong>
-            </p>
-            {/* NEW: Transcription Display */}
-            <div style={{ marginTop: '20px', border: '1px solid #ccc', padding: '10px', minHeight: '100px', background: '#414141', whiteSpace: 'pre-wrap' }}>
-                <strong>Transcription:</strong>
-                <p>{transcription || "..."}</p>
-            </div>
-            <p>
-                <small>Ensure Python VAD server (port {VAD_SERVER_URL.split(':')[2]}) is running and sends JSON messages (e.g., `{"{type: 'VAD_SPEECH_START'}"}`).</small><br/>
-                <small>Ensure Python STT server is running on {STT_SERVER_URL}</small>
-            </p>
-        </div>
-    );
+  return (
+    <div>
+      <h2>WebRTC VAD Client</h2>
+      <p>Connection State: <strong>{connectionState}</strong></p>
+      <p>VAD Status: <strong>{vadStatus ? 'Speech Detected' : 'Silence'}</strong></p>
+      <p>Transcription: <strong>{transcription || "..."}</strong></p>
+      {error && <p style={{ color: 'red' }}>Error: {error}</p>}
+      <div>
+        {connectionState === 'disconnected' || connectionState === 'failed' ? (
+          <button onClick={startWebRTC} disabled={isConnecting}>
+            {isConnecting ? 'Connecting...' : 'Start VAD'}
+          </button>
+        ) : (
+          <button onClick={stopWebRTC} disabled={connectionState === 'closing' || isConnecting}>
+            Stop VAD
+          </button>
+        )}
+      </div>
+    </div>
+  );
 }
 
 export default AudioVADClient;
