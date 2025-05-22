@@ -3,3 +3,12 @@ openai-whisper
 numpy
 torch
 python-dotenv
+aiortc>=1.5.0
+aiohttp>=3.8.5
+aioice>=0.9.0
+pylibsrtp>=0.10.0
+python-dotenv
+aiortc>=1.5.0
+aioice>=0.9.0
+pylibsrtp>=0.10.0
+torchaudio
